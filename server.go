@@ -8,8 +8,9 @@ import (
 	"fmt"           // print text
 	"log"           // บันทึก error
 	"net"           // tcp
-	"sync"          // ใช้ป้องกันไม่ให้พนักงาน (Thread) หลายคนแย่งกันแก้ไขข้อมูลเดียวกัน (Mutex)
-	"time"          // ใช้จัดการเรื่องเวลา
+	"os"
+	"sync" // ใช้ป้องกันไม่ให้พนักงาน (Thread) หลายคนแย่งกันแก้ไขข้อมูลเดียวกัน (Mutex)
+	"time" // ใช้จัดการเรื่องเวลา
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/lib/pq"
@@ -67,8 +68,8 @@ type ActionRequest struct {
 // --- 2. Global Variables ---
 // =====================================================================
 
-var jwtSecretKey = []byte("Tweety_Super_Secret_Key_2026")
-var googleClientID = "305844664566-7392po3uu4d377lvcqao4i9jcnj7plgc.apps.googleusercontent.com"
+var jwtSecretKey = os.Getenv("JWT_SECRET")
+var googleClientID = os.Getenv("GOOGLE_CLIENT_ID")
 
 // 🟢 เปลี่ยนจากเก็บแค่ net.Conn เป็นเก็บ UserID คู่กับ net.Conn
 // ทำให้เรารู้ว่าใคร (ID อะไร) กำลังใช้ Connection ไหนอยู่
@@ -81,7 +82,7 @@ var db *sql.DB
 // =====================================================================
 
 func main() {
-	connStr := "postgresql://postgres.gapsfsqsefgvtgmncfky:TweetyProjectCN321@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres?sslmode=require"
+	connStr := os.Getenv("DB_URL")
 
 	var err error
 	db, err = sql.Open("postgres", connStr)
