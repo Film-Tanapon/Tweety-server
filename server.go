@@ -97,7 +97,12 @@ func main() {
 	}
 	fmt.Println("✅ Connected to Supabase successfully!")
 
-	listener, err := net.Listen("tcp", "0.0.0.0:3000")
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+
+	listener, err := net.Listen("tcp", "0.0.0.0:"+port)
 	if err != nil {
 		fmt.Println("Error starting server:", err)
 		return
