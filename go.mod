@@ -1,6 +1,6 @@
 module tweety-server
 
-go 1.25.7
+go 1.22
 
 require (
 	cloud.google.com/go/auth v0.18.1 // indirect
