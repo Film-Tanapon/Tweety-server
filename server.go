@@ -54,6 +54,8 @@ type Message struct {
 
 type ActionRequest struct {
 	Action     string   `json:"action"`
+	Username   string   `json:"username,omitempty"`
+	Password   string   `json:"password,omitempty"`
 	UserID     int      `json:"user_id"`
 	ReceiverID int      `json:"receiver_id,omitempty"`
 	PostID     int      `json:"post_id,omitempty"`
@@ -203,7 +205,41 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 				// 🟢 ตอบกลับผ่าน WebSockets
 				ws.WriteMessage(websocket.TextMessage, jsonResp)
 				fmt.Printf("✅ Google Login Success! Issued JWT for User %d\n", userID)
+			case "login":
+				// 1. ค้นหา User จาก Username และ Password ใน Database
+				var u User
+				var dbPassword string
+				err := db.QueryRow("SELECT id, email, username, password_hash FROM users WHERE username = $1", req.Username).Scan(&u.ID, &u.Email, &u.Username, &dbPassword)
 
+				if err != nil || dbPassword != req.Password {
+					// ถ้าไม่เจอ หรือรหัสไม่ตรง (ในเคสนี้เราเช็คตรงๆ ตามที่คุณต้องการ)
+					response := map[string]interface{}{
+						"action":  "login_failed",
+						"message": "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง",
+					}
+					jsonResp, _ := json.Marshal(response)
+					ws.WriteMessage(websocket.TextMessage, jsonResp)
+					continue
+				}
+
+				// 2. ถ้าผ่าน ให้สร้าง JWT
+				appToken, _ := generateJWT(u.ID, u.Email)
+
+				// 3. บันทึกการเชื่อมต่อ
+				mutex.Lock()
+				userConnections[u.ID] = ws
+				loggedInUserID = u.ID
+				mutex.Unlock()
+
+				// 4. ส่งกลับไปที่ Flutter
+				response := map[string]interface{}{
+					"action":  "login_success",
+					"jwt":     appToken,
+					"user_id": u.ID,
+				}
+				jsonResp, _ := json.Marshal(response)
+				ws.WriteMessage(websocket.TextMessage, jsonResp)
+				fmt.Printf("✅ Manual Login Success: User %s\n", u.Username)
 			case "register_connection":
 				mutex.Lock()
 				userConnections[req.UserID] = ws
