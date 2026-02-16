@@ -1,18 +1,18 @@
 package main
 
 import (
-	"context"
-	"database/sql"
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http" // เปลี่ยนจาก net มาใช้ net/http สำหรับ WebSockets
+	"bufio"         // ใช้อ่านข้อมูลจากเครือข่ายทีละบรรทัด
+	"context"       // จัดการเรื่องเวลา (Timeout), ยกเลิกคำสั่ง
+	"database/sql"  // ติดต่อไป SQL
+	"encoding/json" // json <-> struct
+	"fmt"           // print text
+	"log"           // บันทึก error
+	"net"           // tcp
 	"os"
 	"sync" // ใช้ป้องกันไม่ให้พนักงาน (Thread) หลายคนแย่งกันแก้ไขข้อมูลเดียวกัน (Mutex)
 	"time" // ใช้จัดการเรื่องเวลา
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/gorilla/websocket" // 🟢 นำเข้าแพ็กเกจ WebSocket
 	"github.com/lib/pq"
 	"google.golang.org/api/idtoken"
 )
@@ -42,26 +42,25 @@ type PostFeed struct {
 	CreatedAt       time.Time `json:"created_at"`
 }
 
+// 🟢 โครงสร้างใหม่สำหรับระบบแชท
 type Message struct {
 	ID         int       `json:"id"`
 	SenderID   int       `json:"sender_id"`
 	ReceiverID int       `json:"receiver_id"`
 	Content    string    `json:"content"`
-	ImageURL   *string   `json:"image_url"`
+	ImageURL   *string   `json:"image_url"` // ใช้ pointer เผื่อเป็น null
 	IsRead     bool      `json:"is_read"`
 	CreatedAt  time.Time `json:"created_at"`
 }
 
 type ActionRequest struct {
 	Action     string   `json:"action"`
-	Username   string   `json:"username,omitempty"`
-	Password   string   `json:"password,omitempty"`
-	UserID     int      `json:"user_id"`
-	ReceiverID int      `json:"receiver_id,omitempty"`
+	UserID     int      `json:"user_id"`               // สำหรับ Post คือคนโพสต์, สำหรับ Message คือคนส่ง
+	ReceiverID int      `json:"receiver_id,omitempty"` // 🟢 เพิ่ม: สำหรับ Message (คนรับ)
 	PostID     int      `json:"post_id,omitempty"`
 	Content    string   `json:"content,omitempty"`
-	ImageURLs  []string `json:"image_urls,omitempty"`
-	ImageURL   string   `json:"image_url,omitempty"`
+	ImageURLs  []string `json:"image_urls,omitempty"` // สำหรับ Post
+	ImageURL   string   `json:"image_url,omitempty"`  // 🟢 เพิ่ม: สำหรับ Message (ส่งได้ทีละรูป)
 	Token      string   `json:"token,omitempty"`
 }
 
@@ -72,15 +71,9 @@ type ActionRequest struct {
 var jwtSecretKey = os.Getenv("JWT_SECRET")
 var googleClientID = os.Getenv("GOOGLE_CLIENT_ID")
 
-// 🟢 อัปเกรดการเชื่อมต่อจาก HTTP เป็น WebSocket
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // อนุญาตทุกโดเมน (Flutter)
-	},
-}
-
-// 🟢 เปลี่ยนชนิดการเก็บข้อมูลเป็น *websocket.Conn
-var userConnections = make(map[int]*websocket.Conn)
+// 🟢 เปลี่ยนจากเก็บแค่ net.Conn เป็นเก็บ UserID คู่กับ net.Conn
+// ทำให้เรารู้ว่าใคร (ID อะไร) กำลังใช้ Connection ไหนอยู่
+var userConnections = make(map[int]net.Conn)
 var mutex = &sync.Mutex{}
 var db *sql.DB
 
@@ -109,15 +102,25 @@ func main() {
 		port = "3000"
 	}
 
-	// 🟢 ตั้งค่า Route ให้รองรับ WebSockets ที่พาร์ท /ws
-	http.HandleFunc("/ws", handleConnections)
-
-	fmt.Printf("🚀 WebSocket Server Started on port %s...\n", port)
-
-	// 🟢 รันเซิร์ฟเวอร์ด้วย ListenAndServe (รองรับ Render 100%)
-	err = http.ListenAndServe("0.0.0.0:"+port, nil)
+	listener, err := net.Listen("tcp", "0.0.0.0:"+port)
 	if err != nil {
-		log.Fatal("Error starting server:", err)
+		fmt.Println("Error starting server:", err)
+		return
+	}
+	defer listener.Close()
+	fmt.Println("🚀 Server Started on port 3000...")
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			fmt.Println("Error accepting:", err)
+			continue
+		}
+
+		fmt.Println("New client connected:", conn.RemoteAddr())
+		// สังเกตว่าเรายังไม่เอาเข้า userConnections ทันที
+		// รอให้ Client ส่ง action "register_connection" มาบอก UserID ก่อน
+		go handleClient(conn)
 	}
 }
 
@@ -125,19 +128,12 @@ func main() {
 // --- 4. Client Handler ---
 // =====================================================================
 
-// 🟢 ปรับพารามิเตอร์มารับ HTTP เพื่ออัปเกรดเป็น WebSockets
-func handleConnections(w http.ResponseWriter, r *http.Request) {
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		fmt.Println("Error upgrading to websocket:", err)
-		return
-	}
-
-	fmt.Println("New client connected via WebSocket!")
-	var loggedInUserID int
+func handleClient(conn net.Conn) {
+	var loggedInUserID int // ตัวแปรจำว่า Connection นี้คือของ UserID อะไร
 
 	defer func() {
-		ws.Close()
+		conn.Close()
+		// ลบออกจากระบบเมื่อ Client ตัดการเชื่อมต่อ
 		if loggedInUserID != 0 {
 			mutex.Lock()
 			delete(userConnections, loggedInUserID)
@@ -146,20 +142,20 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// ส่งประวัติ Post Feed ทันทีที่เชื่อมต่อ
-	sendHistoryToClient(ws)
+	// ส่งประวัติ Post Feed ทันทีที่เชื่อมต่อ (ฟังก์ชันเดิม ไม่กระทบ)
+	sendHistoryToClient(conn)
 
+	reader := bufio.NewReader(conn)
 	for {
-		// 🟢 รับข้อความผ่าน WebSockets แทน bufio
-		_, messageData, err := ws.ReadMessage()
+		messageLine, err := reader.ReadString('\n')
 		if err != nil {
-			break // ออกจากลูปเมื่อเกิด Error หรือตัดการเชื่อมต่อ
+			return // ออกจากลูปเมื่อเกิด Error หรือตัดการเชื่อมต่อ
 		}
 
-		fmt.Printf("Received: %s\n", string(messageData))
+		fmt.Printf("Received: %s", messageLine)
 
 		var req ActionRequest
-		err = json.Unmarshal(messageData, &req)
+		err = json.Unmarshal([]byte(messageLine), &req)
 
 		if err == nil {
 			switch req.Action {
@@ -170,115 +166,96 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
+				// ก. ยืนยัน Token กับ Google
 				payload, err := idtoken.Validate(context.Background(), req.Token, googleClientID)
 				if err != nil {
 					fmt.Println("❌ Invalid Google Token:", err)
 					continue
 				}
 
+				// ข. ดึงข้อมูลอีเมลและชื่อออกมา
 				email := payload.Claims["email"].(string)
 				name := payload.Claims["name"].(string)
+				// picture := payload.Claims["picture"].(string) // ถ้าอยากดึงรูปโปรไฟล์
 
+				// ค. หาใน Database ว่ามี User นี้หรือยัง (ถ้าไม่มีให้สร้างใหม่)
 				userID, err := getOrCreateUserByEmail(email, name)
 				if err != nil {
 					fmt.Println("❌ Error DB getOrCreateUser:", err)
 					continue
 				}
 
+				// ง. สร้าง JWT (App Token) ของระบบเรา
 				appToken, err := generateJWT(userID, email)
 				if err != nil {
 					fmt.Println("❌ Error generating JWT:", err)
 					continue
 				}
 
+				// จ. จับ Connection นี้ผูกกับ UserID ทันที (ล็อกอินสำเร็จ)
 				mutex.Lock()
-				userConnections[userID] = ws
+				userConnections[userID] = conn
 				loggedInUserID = userID
 				mutex.Unlock()
 
+				// ฉ. ส่ง JWT กลับไปให้ Flutter
 				response := map[string]interface{}{
 					"action":  "login_success",
 					"jwt":     appToken,
 					"user_id": userID,
 				}
 				jsonResp, _ := json.Marshal(response)
-				// 🟢 ตอบกลับผ่าน WebSockets
-				ws.WriteMessage(websocket.TextMessage, jsonResp)
+				conn.Write(append(jsonResp, '\n'))
 				fmt.Printf("✅ Google Login Success! Issued JWT for User %d\n", userID)
-			case "login":
-				// 1. ค้นหา User จาก Username และ Password ใน Database
-				var u User
-				var dbPassword string
-				err := db.QueryRow("SELECT id, email, username, password_hash FROM users WHERE username = $1", req.Username).Scan(&u.ID, &u.Email, &u.Username, &dbPassword)
 
-				if err != nil || dbPassword != req.Password {
-					// ถ้าไม่เจอ หรือรหัสไม่ตรง (ในเคสนี้เราเช็คตรงๆ ตามที่คุณต้องการ)
-					response := map[string]interface{}{
-						"action":  "login_failed",
-						"message": "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง",
-					}
-					jsonResp, _ := json.Marshal(response)
-					ws.WriteMessage(websocket.TextMessage, jsonResp)
-					continue
-				}
-
-				// 2. ถ้าผ่าน ให้สร้าง JWT
-				appToken, _ := generateJWT(u.ID, u.Email)
-
-				// 3. บันทึกการเชื่อมต่อ
-				mutex.Lock()
-				userConnections[u.ID] = ws
-				loggedInUserID = u.ID
-				mutex.Unlock()
-
-				// 4. ส่งกลับไปที่ Flutter
-				response := map[string]interface{}{
-					"action":  "login_success",
-					"jwt":     appToken,
-					"user_id": u.ID,
-				}
-				jsonResp, _ := json.Marshal(response)
-				ws.WriteMessage(websocket.TextMessage, jsonResp)
-				fmt.Printf("✅ Manual Login Success: User %s\n", u.Username)
+			// 🟢 1. การลงทะเบียน Connection เข้ากับ UserID
 			case "register_connection":
 				mutex.Lock()
-				userConnections[req.UserID] = ws
+				userConnections[req.UserID] = conn
 				loggedInUserID = req.UserID
 				mutex.Unlock()
 				fmt.Printf("✅ User %d registered their connection\n", req.UserID)
 
+			// 🟢 2. การส่งข้อความส่วนตัว (Direct Message)
 			case "send_message":
 				if req.ReceiverID == 0 {
 					fmt.Println("❌ Error: Missing receiver_id")
 					continue
 				}
 
+				// บันทึกลง Database
 				msgID, err := saveMessage(req.UserID, req.ReceiverID, req.Content, req.ImageURL)
 				if err == nil {
+					// ดึงข้อมูลเต็มกลับมา (พร้อม Timestamp)
 					fullMsg, err := getMessageByID(msgID)
 					if err == nil {
+						// ห่อข้อมูลเพื่อบอก Client ว่านี่คือ Message นะ ไม่ใช่ Post Feed
 						responseMap := map[string]interface{}{
 							"action": "new_message",
 							"data":   fullMsg,
 						}
 						msgJSON, _ := json.Marshal(responseMap)
 
-						sendMessageToUser(req.ReceiverID, msgJSON)
-						sendMessageToUser(req.UserID, msgJSON)
+						// ส่งไปหาคนรับ (ถ้าออนไลน์)
+						sendMessageToUser(req.ReceiverID, append(msgJSON, '\n'))
+						// ส่งกลับไปหาตัวเองด้วย (เผื่อใช้อัปเดต UI ทันที)
+						sendMessageToUser(req.UserID, append(msgJSON, '\n'))
 					}
 				}
 
+			// 🟡 3. ฟังก์ชันเดิม (Post Feed)
 			case "create_post":
 				newPostID, err := createPost(req.UserID, req.Content, req.ImageURLs, nil)
 				if err == nil {
 					newPostData, err := getSinglePost(newPostID)
 					if err == nil {
+						// ห่อข้อมูลเพื่อให้ Client แยกแยะได้ (Optionally) หรือส่งตรงๆ แบบเดิม
 						responseMap := map[string]interface{}{
 							"action": "new_post",
 							"data":   newPostData,
 						}
 						postJSON, _ := json.Marshal(responseMap)
-						broadcast(postJSON)
+						broadcast(append(postJSON, '\n'))
 					}
 				}
 
@@ -298,10 +275,11 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 }
 
 func generateJWT(userID int, email string) (string, error) {
+	// กำหนดข้อมูลที่จะใส่ลงในบัตร (Claims)
 	claims := jwt.MapClaims{
 		"user_id": userID,
 		"email":   email,
-		"exp":     time.Now().Add(time.Hour * 24 * 7).Unix(),
+		"exp":     time.Now().Add(time.Hour * 24 * 7).Unix(), // หมดอายุใน 7 วัน
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -310,9 +288,11 @@ func generateJWT(userID int, email string) (string, error) {
 
 func getOrCreateUserByEmail(email string, username string) (int, error) {
 	var userID int
+	// ลองหาจาก DB
 	err := db.QueryRow("SELECT id FROM users WHERE email = $1", email).Scan(&userID)
 
 	if err == sql.ErrNoRows {
+		// ถ้าไม่เจอ (คนเพิ่งเคยเข้าครั้งแรก) ให้ Insert
 		err = db.QueryRow(
 			"INSERT INTO users (email, username) VALUES ($1, $2) RETURNING id",
 			email, username,
@@ -326,15 +306,14 @@ func getOrCreateUserByEmail(email string, username string) (int, error) {
 		return 0, err
 	}
 
-	return userID, nil
+	return userID, nil // เจอใน DB คืนค่า ID เดิมกลับไป
 }
 
 // =====================================================================
 // --- 5. Network Functions ---
 // =====================================================================
 
-// 🟢 ปรับพารามิเตอร์เป็น *websocket.Conn
-func sendHistoryToClient(ws *websocket.Conn) {
+func sendHistoryToClient(client net.Conn) {
 	posts, err := getFeedPosts()
 	if err != nil {
 		fmt.Println("❌ Error querying feed history:", err)
@@ -344,41 +323,42 @@ func sendHistoryToClient(ws *websocket.Conn) {
 	for i := len(posts) - 1; i >= 0; i-- {
 		p := posts[i]
 
+		// ห่อข้อมูลเพื่อให้ Client รู้ว่าเป็นชนิด new_post (ปรับให้เข้ากับ Message)
 		responseMap := map[string]interface{}{
 			"action": "new_post",
 			"data":   p,
 		}
 		jsonData, _ := json.Marshal(responseMap)
-		// 🟢 ส่งข้อมูลเป็น TextMessage ไม่ต้องต่อ \n แล้ว
-		ws.WriteMessage(websocket.TextMessage, jsonData)
+		client.Write(append(jsonData, '\n'))
 	}
 	fmt.Println("✅ Sent feed history to client")
 }
 
+// 🟢 ส่งข้อมูลให้เฉพาะคนๆ เดียว (เช่น DM)
 func sendMessageToUser(userID int, data []byte) {
 	mutex.Lock()
 	defer mutex.Unlock()
 
 	if conn, ok := userConnections[userID]; ok {
-		// 🟢 ใช้ WriteMessage
-		err := conn.WriteMessage(websocket.TextMessage, data)
+		_, err := conn.Write(data)
 		if err != nil {
 			fmt.Printf("Error sending to user %d: %v\n", userID, err)
 			conn.Close()
 			delete(userConnections, userID)
 		}
 	} else {
+		// ถ้าไม่ได้ออนไลน์อยู่ ข้อความก็ถูกเซฟลง DB ไปแล้ว ไม่เป็นไร
 		fmt.Printf("User %d is offline.\n", userID)
 	}
 }
 
+// ส่งให้ทุกคนที่อยู่ในระบบ (เช่น New Feed)
 func broadcast(data []byte) {
 	mutex.Lock()
 	defer mutex.Unlock()
 
 	for userID, conn := range userConnections {
-		// 🟢 ใช้ WriteMessage
-		err := conn.WriteMessage(websocket.TextMessage, data)
+		_, err := conn.Write(data)
 		if err != nil {
 			fmt.Printf("Error broadcasting to user %d: %v\n", userID, err)
 			conn.Close()
@@ -397,10 +377,10 @@ func createPost(userID int, content string, imageURLs []string, parentPostID *in
 	}
 
 	sqlStatement := `
-		INSERT INTO posts (user_id, content, image_urls, parent_post_id) 
-		VALUES ($1, $2, $3, $4)
-		RETURNING id
-	`
+        INSERT INTO posts (user_id, content, image_urls, parent_post_id) 
+        VALUES ($1, $2, $3, $4)
+        RETURNING id
+    `
 	var newPostID int
 	err := db.QueryRow(sqlStatement, userID, content, pq.Array(imageURLs), parentPostID).Scan(&newPostID)
 
@@ -414,15 +394,15 @@ func createPost(userID int, content string, imageURLs []string, parentPostID *in
 
 func getSinglePost(postID int) (*PostFeed, error) {
 	sqlStatement := `
-		SELECT 
-			p.id, p.user_id, u.username, COALESCE(u.profile_image_url, ''), 
-			p.content, COALESCE(p.image_urls, '{}'), p.parent_post_id,
-			(SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count,
-			p.created_at
-		FROM posts p
-		JOIN users u ON p.user_id = u.id
-		WHERE p.id = $1
-	`
+        SELECT 
+            p.id, p.user_id, u.username, COALESCE(u.profile_image_url, ''), 
+            p.content, COALESCE(p.image_urls, '{}'), p.parent_post_id,
+            (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count,
+            p.created_at
+        FROM posts p
+        JOIN users u ON p.user_id = u.id
+        WHERE p.id = $1
+    `
 	var post PostFeed
 	var imgURLs pq.StringArray
 
@@ -441,17 +421,17 @@ func getSinglePost(postID int) (*PostFeed, error) {
 
 func getFeedPosts() ([]PostFeed, error) {
 	sqlStatement := `
-		SELECT 
-			p.id, p.user_id, u.username, COALESCE(u.profile_image_url, ''), 
-			p.content, COALESCE(p.image_urls, '{}'), p.parent_post_id,
-			(SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count,
-			p.created_at
-		FROM posts p
-		JOIN users u ON p.user_id = u.id
-		WHERE p.parent_post_id IS NULL 
-		ORDER BY p.created_at DESC
-		LIMIT 50;
-	`
+        SELECT 
+            p.id, p.user_id, u.username, COALESCE(u.profile_image_url, ''), 
+            p.content, COALESCE(p.image_urls, '{}'), p.parent_post_id,
+            (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count,
+            p.created_at
+        FROM posts p
+        JOIN users u ON p.user_id = u.id
+        WHERE p.parent_post_id IS NULL 
+        ORDER BY p.created_at DESC
+        LIMIT 50;
+    `
 	rows, err := db.Query(sqlStatement)
 	if err != nil {
 		return nil, err
@@ -478,7 +458,7 @@ func getFeedPosts() ([]PostFeed, error) {
 }
 
 // =====================================================================
-// --- 7. Database Functions (Messages) ---
+// --- 7. Database Functions (Messages) --- 🟢 (เพิ่มใหม่)
 // =====================================================================
 
 func saveMessage(senderID int, receiverID int, content string, imageURL string) (int, error) {
@@ -493,10 +473,10 @@ func saveMessage(senderID int, receiverID int, content string, imageURL string) 
 	}
 
 	sqlStatement := `
-		INSERT INTO messages (sender_id, receiver_id, content, image_url) 
-		VALUES ($1, $2, $3, $4)
-		RETURNING id
-	`
+        INSERT INTO messages (sender_id, receiver_id, content, image_url) 
+        VALUES ($1, $2, $3, $4)
+        RETURNING id
+    `
 	var newMsgID int
 	err := db.QueryRow(sqlStatement, senderID, receiverID, contentParam, imgParam).Scan(&newMsgID)
 
@@ -510,9 +490,9 @@ func saveMessage(senderID int, receiverID int, content string, imageURL string) 
 
 func getMessageByID(msgID int) (*Message, error) {
 	sqlStatement := `
-		SELECT id, sender_id, receiver_id, COALESCE(content, ''), image_url, is_read, created_at 
-		FROM messages WHERE id = $1
-	`
+        SELECT id, sender_id, receiver_id, COALESCE(content, ''), image_url, is_read, created_at 
+        FROM messages WHERE id = $1
+    `
 	var msg Message
 	err := db.QueryRow(sqlStatement, msgID).Scan(
 		&msg.ID, &msg.SenderID, &msg.ReceiverID,
