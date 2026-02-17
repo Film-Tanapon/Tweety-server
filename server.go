@@ -151,7 +151,17 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			otpStorage[req.Email] = otp
 			mutex.Unlock()
 
-			go sendEmailOTP(req.Email, otp)
+			err := sendEmailOTP(req.Email, otp)
+			if err != nil {
+				// 🔴 ถ้าส่งอีเมลไม่สำเร็จ ให้พิมพ์ Error ลง Log บน Render
+				fmt.Println("❌ Failed to send email:", err)
+				// 🔴 แล้วตอบแอปกลับไปว่าส่งไม่สำเร็จ
+				sendErrorToClient(conn, "Failed to send email. Check server configuration.")
+				continue
+			}
+
+			// ✅ ถ้าถึงตรงนี้ แปลว่าส่งอีเมลสำเร็จแล้วจริงๆ ค่อยตอบกลับแอป
+			fmt.Println("✅ Email sent successfully to:", req.Email)
 			sendJSON(conn, map[string]interface{}{"action": "otp_sent"})
 
 		case "email_register":
