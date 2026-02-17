@@ -5,9 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
-	"net/smtp"
 	"os"
 	"sync"
 	"time"
@@ -133,9 +131,9 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		}
 
 		switch req.Action {
-		case "request_otp":
-			if req.Email == "" {
-				sendErrorToClient(conn, "Email is required")
+		case "email_register":
+			if req.Email == "" || req.Password == "" || req.Username == "" || req.OTP == "" {
+				sendErrorToClient(conn, "Missing required fields")
 				continue
 			}
 
@@ -145,43 +143,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 				sendErrorToClient(conn, "Email already exists")
 				continue
 			}
-
-			otp := fmt.Sprintf("%06d", rand.Intn(1000000))
-			mutex.Lock()
-			otpStorage[req.Email] = otp
-			mutex.Unlock()
-
-			err := sendEmailOTP(req.Email, otp)
-			if err != nil {
-				// 🔴 ถ้าส่งอีเมลไม่สำเร็จ ให้พิมพ์ Error ลง Log บน Render
-				fmt.Println("❌ Failed to send email:", err)
-				// 🔴 แล้วตอบแอปกลับไปว่าส่งไม่สำเร็จ
-				sendErrorToClient(conn, "Failed to send email. Check server configuration.")
-				continue
-			}
-
-			// ✅ ถ้าถึงตรงนี้ แปลว่าส่งอีเมลสำเร็จแล้วจริงๆ ค่อยตอบกลับแอป
-			fmt.Println("✅ Email sent successfully to:", req.Email)
-			sendJSON(conn, map[string]interface{}{"action": "otp_sent"})
-
-		case "email_register":
-			if req.Email == "" || req.Password == "" || req.Username == "" || req.OTP == "" {
-				sendErrorToClient(conn, "Missing required fields")
-				continue
-			}
-
-			mutex.Lock()
-			savedOTP, exists := otpStorage[req.Email]
-			mutex.Unlock()
-
-			if !exists || savedOTP != req.OTP {
-				sendErrorToClient(conn, "Invalid or expired OTP")
-				continue
-			}
-
-			mutex.Lock()
-			delete(otpStorage, req.Email)
-			mutex.Unlock()
 
 			hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 			if err != nil {
@@ -268,26 +229,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-}
-
-func sendEmailOTP(toEmail, otp string) error {
-	from := os.Getenv("SMTP_EMAIL")
-	password := os.Getenv("SMTP_PASSWORD")
-
-	if from == "" || password == "" {
-		return fmt.Errorf("SMTP credentials missing in environment variables")
-	}
-
-	smtpHost := "smtp-relay.brevo.com"
-	smtpPort := "2525"
-
-	msg := []byte("From: Tweety App\r\n" +
-		"To: " + toEmail + "\r\n" +
-		"Subject: Your Tweety Verification Code\r\n\r\n" +
-		"Your verification code is: " + otp + "\r\n")
-
-	auth := smtp.PlainAuth("", from, password, smtpHost)
-	return smtp.SendMail(smtpHost+":"+smtpPort, auth, from, []string{toEmail}, msg)
 }
 
 // 🟢 Helper Function พื้นฐาน
