@@ -169,6 +169,40 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			})
 			fmt.Printf("✅ User %s Registered successfully!\n", req.Username)
 
+		case "login":
+			// ใช้ req.Username รับค่า (Flutter จะส่งมาทั้ง Email หรือ Username ในตัวแปรนี้)
+			if req.Username == "" || req.Password == "" {
+				sendErrorToClient(conn, "กรุณากรอกข้อมูลให้ครบ")
+				continue
+			}
+
+			var userID int
+			var passwordHash string
+			var email string
+
+			// ค้นหาใน Database ว่าตรงกับ email หรือ username หรือไม่
+			err := db.QueryRow("SELECT id, email, password_hash FROM users WHERE email = $1 OR username = $1", req.Username).Scan(&userID, &email, &passwordHash)
+			if err != nil {
+				sendErrorToClient(conn, "ชื่อผู้ใช้ อีเมล หรือ รหัสผ่านไม่ถูกต้อง")
+				continue
+			}
+
+			// ตรวจสอบความถูกต้องของรหัสผ่าน
+			err = bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password))
+			if err != nil {
+				sendErrorToClient(conn, "ชื่อผู้ใช้ อีเมล หรือ รหัสผ่านไม่ถูกต้อง")
+				continue
+			}
+
+			// หากถูกต้อง สร้าง JWT Token และส่งกลับไป
+			appToken, _ := generateJWT(userID, email)
+			sendJSON(conn, map[string]interface{}{
+				"action":  "login_success",
+				"jwt":     appToken,
+				"user_id": userID,
+			})
+			fmt.Printf("✅ User %s Logged in successfully!\n", req.Username)
+
 		case "google_login":
 			if req.Token == "" {
 				continue
