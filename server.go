@@ -278,8 +278,8 @@ func sendEmailOTP(toEmail, otp string) error {
 		return fmt.Errorf("SMTP credentials missing in environment variables")
 	}
 
-	smtpHost := "smtp.gmail.com"
-	smtpPort := "587"
+	smtpHost := "smtp-relay.brevo.com"
+	smtpPort := "2525"
 
 	msg := []byte("From: Tweety App\r\n" +
 		"To: " + toEmail + "\r\n" +
