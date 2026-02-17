@@ -278,6 +278,34 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 				responseMap := map[string]interface{}{"action": "new_post", "data": newPostData}
 				broadcast(responseMap)
 			}
+		case "create_comment":
+			// 1. ตรวจสอบว่ามีข้อมูลครบไหม
+			if req.UserID == 0 || req.PostID == 0 || req.Content == "" {
+				sendErrorToClient(conn, "Missing required fields for comment")
+				continue
+			}
+
+			// 2. เอา PostID ที่ส่งมาแปลงเป็น Pointer เพื่อส่งให้ parentPostID
+			parentID := req.PostID
+
+			// 3. สร้างโพสต์ใหม่โดยระบุ Parent (ก็คือการสร้างคอมเมนต์)
+			newCommentID, err := createPost(req.UserID, req.Content, req.ImageURLs, &parentID)
+
+			if err == nil {
+				// 4. ดึงข้อมูลคอมเมนต์ที่เพิ่งสร้างเสร็จ
+				newCommentData, _ := getSinglePost(newCommentID)
+
+				// 5. Broadcast แจ้งเตือนทุกคนที่เชื่อมต่ออยู่ว่ามี 'new_comment'
+				responseMap := map[string]interface{}{
+					"action": "new_comment", // 🟢 ตรงกับที่ Flutter ดักรอรับ
+					"data":   newCommentData,
+				}
+				broadcast(responseMap)
+				fmt.Printf("💬 User %d commented on Post %d\n", req.UserID, req.PostID)
+			} else {
+				fmt.Println("Create Comment Error:", err)
+				sendErrorToClient(conn, "Failed to add comment")
+			}
 		}
 	}
 }
