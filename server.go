@@ -170,7 +170,7 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			fmt.Printf("✅ User %s Registered successfully!\n", req.Username)
 
 		case "login":
-			// ใช้ req.Username รับค่า (Flutter จะส่งมาทั้ง Email หรือ Username ในตัวแปรนี้)
+			// ใช้ req.Username รับค่า
 			if req.Username == "" || req.Password == "" {
 				sendErrorToClient(conn, "กรุณากรอกข้อมูลให้ครบ")
 				continue
@@ -179,9 +179,16 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			var userID int
 			var passwordHash string
 			var email string
+			var dbUsername string
+			var profileImageURL sql.NullString // 🟢 ใช้ NullString เผื่อค่าใน DB เป็น NULL (ยังไม่ได้อัปโหลดรูป)
 
-			// ค้นหาใน Database ว่าตรงกับ email หรือ username หรือไม่
-			err := db.QueryRow("SELECT id, email, password_hash FROM users WHERE email = $1 OR username = $1", req.Username).Scan(&userID, &email, &passwordHash)
+			// 🟢 Query ดึงเฉพาะคอลัมน์ที่มีอยู่จริงในตาราง users ของคุณ
+			query := `SELECT id, email, password_hash, username, profile_image_url FROM users WHERE email = $1 OR username = $1`
+
+			err := db.QueryRow(query, req.Username).Scan(
+				&userID, &email, &passwordHash, &dbUsername, &profileImageURL,
+			)
+
 			if err != nil {
 				sendErrorToClient(conn, "ชื่อผู้ใช้ อีเมล หรือ รหัสผ่านไม่ถูกต้อง")
 				continue
@@ -194,12 +201,22 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// หากถูกต้อง สร้าง JWT Token และส่งกลับไป
+			// หากถูกต้อง สร้าง JWT Token
 			appToken, _ := generateJWT(userID, email)
+
+			// 🟢 สร้าง Handle โดยเอา @ มาต่อหน้า username
+			dbHandle := "@" + dbUsername
+
+			// 🟢 ส่งข้อมูล Profile กลับไป (ส่ง 0 สำหรับยอดฟอลไปก่อน)
 			sendJSON(conn, map[string]interface{}{
-				"action":  "login_success",
-				"jwt":     appToken,
-				"user_id": userID,
+				"action":            "login_success",
+				"jwt":               appToken,
+				"user_id":           userID,
+				"username":          dbUsername,
+				"handle":            dbHandle,
+				"following":         0,
+				"followers":         0,
+				"profile_image_url": profileImageURL.String, // ส่งรูปกลับไปด้วย
 			})
 			fmt.Printf("✅ User %s Logged in successfully!\n", req.Username)
 
