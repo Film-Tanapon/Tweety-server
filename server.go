@@ -306,6 +306,20 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 				fmt.Println("Create Comment Error:", err)
 				sendErrorToClient(conn, "Failed to add comment")
 			}
+		case "get_comments":
+			if req.PostID == 0 {
+				continue
+			}
+			comments, err := getCommentsByPostID(req.PostID)
+			if err == nil {
+				// ส่งกลับเฉพาะคนที่ขอ (ไม่ได้ broadcast ให้ทุกคน)
+				sendJSON(conn, map[string]interface{}{
+					"action": "load_comments",
+					"data":   comments,
+				})
+			} else {
+				fmt.Println("Error fetching comments:", err)
+			}
 		}
 	}
 }
@@ -415,4 +429,35 @@ func getMessageByID(msgID int) (*Message, error) {
 	var msg Message
 	err := db.QueryRow(`SELECT id, sender_id, receiver_id, COALESCE(content, ''), image_url, is_read, created_at FROM messages WHERE id = $1`, msgID).Scan(&msg.ID, &msg.SenderID, &msg.ReceiverID, &msg.Content, &msg.ImageURL, &msg.IsRead, &msg.CreatedAt)
 	return &msg, err
+}
+
+func getCommentsByPostID(parentID int) ([]PostFeed, error) {
+	rows, err := db.Query(`
+		SELECT p.id, p.user_id, u.username, COALESCE(u.profile_image_url, ''), 
+		       p.content, COALESCE(p.image_urls, '{}'), p.parent_post_id, 
+		       (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count, p.created_at 
+		FROM posts p 
+		JOIN users u ON p.user_id = u.id 
+		WHERE p.parent_post_id = $1 
+		ORDER BY p.created_at ASC`, parentID) // เรียงจากเก่าไปใหม่
+
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var comments []PostFeed
+	for rows.Next() {
+		var post PostFeed
+		var imgURLs pq.StringArray
+		if err := rows.Scan(&post.PostID, &post.UserID, &post.Username, &post.ProfileImageURL, &post.Content, &imgURLs, &post.ParentPostID, &post.LikeCount, &post.CreatedAt); err == nil {
+			post.ImageURLs = []string(imgURLs)
+			comments = append(comments, post)
+		}
+	}
+	// ถ้าไม่มีคอมเมนต์ให้คืนค่าเป็น array ว่าง (ไม่คืนค่า nil เดี๋ยวฝั่ง Flutter จะพัง)
+	if comments == nil {
+		comments = []PostFeed{}
+	}
+	return comments, nil
 }
