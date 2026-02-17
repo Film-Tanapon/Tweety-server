@@ -14,6 +14,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/lib/pq"
+	"golang.org/x/crypto/bcrypt" // 🟢 เพิ่มไลบรารีสำหรับเข้ารหัส Password
 	"google.golang.org/api/idtoken"
 )
 
@@ -42,26 +43,29 @@ type PostFeed struct {
 	CreatedAt       time.Time `json:"created_at"`
 }
 
-// 🟢 โครงสร้างใหม่สำหรับระบบแชท
 type Message struct {
 	ID         int       `json:"id"`
 	SenderID   int       `json:"sender_id"`
 	ReceiverID int       `json:"receiver_id"`
 	Content    string    `json:"content"`
-	ImageURL   *string   `json:"image_url"` // ใช้ pointer เผื่อเป็น null
+	ImageURL   *string   `json:"image_url"`
 	IsRead     bool      `json:"is_read"`
 	CreatedAt  time.Time `json:"created_at"`
 }
 
 type ActionRequest struct {
 	Action     string   `json:"action"`
-	UserID     int      `json:"user_id"`               // สำหรับ Post คือคนโพสต์, สำหรับ Message คือคนส่ง
-	ReceiverID int      `json:"receiver_id,omitempty"` // 🟢 เพิ่ม: สำหรับ Message (คนรับ)
+	UserID     int      `json:"user_id"`
+	ReceiverID int      `json:"receiver_id,omitempty"`
 	PostID     int      `json:"post_id,omitempty"`
 	Content    string   `json:"content,omitempty"`
-	ImageURLs  []string `json:"image_urls,omitempty"` // สำหรับ Post
-	ImageURL   string   `json:"image_url,omitempty"`  // 🟢 เพิ่ม: สำหรับ Message (ส่งได้ทีละรูป)
+	ImageURLs  []string `json:"image_urls,omitempty"`
+	ImageURL   string   `json:"image_url,omitempty"`
 	Token      string   `json:"token,omitempty"`
+	// 🟢 เพิ่มฟิลด์สำหรับการสมัครสมาชิกด้วย Email/Password
+	Email    string `json:"email,omitempty"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
 }
 
 // =====================================================================
@@ -71,8 +75,6 @@ type ActionRequest struct {
 var jwtSecretKey = os.Getenv("JWT_SECRET")
 var googleClientID = os.Getenv("GOOGLE_CLIENT_ID")
 
-// 🟢 เปลี่ยนจากเก็บแค่ net.Conn เป็นเก็บ UserID คู่กับ net.Conn
-// ทำให้เรารู้ว่าใคร (ID อะไร) กำลังใช้ Connection ไหนอยู่
 var userConnections = make(map[int]net.Conn)
 var mutex = &sync.Mutex{}
 var db *sql.DB
@@ -108,7 +110,7 @@ func main() {
 		return
 	}
 	defer listener.Close()
-	fmt.Println("🚀 Server Started on port 3000...")
+	fmt.Println("🚀 Server Started on port", port, "...")
 
 	for {
 		conn, err := listener.Accept()
@@ -118,8 +120,6 @@ func main() {
 		}
 
 		fmt.Println("New client connected:", conn.RemoteAddr())
-		// สังเกตว่าเรายังไม่เอาเข้า userConnections ทันที
-		// รอให้ Client ส่ง action "register_connection" มาบอก UserID ก่อน
 		go handleClient(conn)
 	}
 }
@@ -129,11 +129,10 @@ func main() {
 // =====================================================================
 
 func handleClient(conn net.Conn) {
-	var loggedInUserID int // ตัวแปรจำว่า Connection นี้คือของ UserID อะไร
+	var loggedInUserID int
 
 	defer func() {
 		conn.Close()
-		// ลบออกจากระบบเมื่อ Client ตัดการเชื่อมต่อ
 		if loggedInUserID != 0 {
 			mutex.Lock()
 			delete(userConnections, loggedInUserID)
@@ -142,14 +141,13 @@ func handleClient(conn net.Conn) {
 		}
 	}()
 
-	// ส่งประวัติ Post Feed ทันทีที่เชื่อมต่อ (ฟังก์ชันเดิม ไม่กระทบ)
 	sendHistoryToClient(conn)
 
 	reader := bufio.NewReader(conn)
 	for {
 		messageLine, err := reader.ReadString('\n')
 		if err != nil {
-			return // ออกจากลูปเมื่อเกิด Error หรือตัดการเชื่อมต่อ
+			return
 		}
 
 		fmt.Printf("Received: %s", messageLine)
@@ -160,45 +158,76 @@ func handleClient(conn net.Conn) {
 		if err == nil {
 			switch req.Action {
 
+			// 🟢 Action สมัครสมาชิกจาก Flutter
+			case "email_register":
+				if req.Email == "" || req.Password == "" || req.Username == "" {
+					sendErrorToClient(conn, "Missing required fields")
+					continue
+				}
+
+				// เข้ารหัส Password
+				hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+				if err != nil {
+					sendErrorToClient(conn, "Error hashing password")
+					continue
+				}
+
+				// บันทึกลง Database
+				var newUserID int
+				err = db.QueryRow(
+					"INSERT INTO users (email, username, password_hash) VALUES ($1, $2, $3) RETURNING id",
+					req.Email, req.Username, string(hashedPassword),
+				).Scan(&newUserID)
+
+				if err != nil {
+					sendErrorToClient(conn, "Email or Username already exists")
+					continue
+				}
+
+				// สร้าง JWT ให้หลังจากสมัครเสร็จ
+				appToken, _ := generateJWT(newUserID, req.Email)
+
+				response := map[string]interface{}{
+					"action":  "register_success",
+					"jwt":     appToken,
+					"user_id": newUserID,
+				}
+				jsonResp, _ := json.Marshal(response)
+				conn.Write(append(jsonResp, '\n'))
+				fmt.Printf("✅ User %s Registered successfully! ID: %d\n", req.Username, newUserID)
+
 			case "google_login":
 				if req.Token == "" {
 					fmt.Println("❌ Missing token")
 					continue
 				}
 
-				// ก. ยืนยัน Token กับ Google
 				payload, err := idtoken.Validate(context.Background(), req.Token, googleClientID)
 				if err != nil {
 					fmt.Println("❌ Invalid Google Token:", err)
 					continue
 				}
 
-				// ข. ดึงข้อมูลอีเมลและชื่อออกมา
 				email := payload.Claims["email"].(string)
 				name := payload.Claims["name"].(string)
-				// picture := payload.Claims["picture"].(string) // ถ้าอยากดึงรูปโปรไฟล์
 
-				// ค. หาใน Database ว่ามี User นี้หรือยัง (ถ้าไม่มีให้สร้างใหม่)
 				userID, err := getOrCreateUserByEmail(email, name)
 				if err != nil {
 					fmt.Println("❌ Error DB getOrCreateUser:", err)
 					continue
 				}
 
-				// ง. สร้าง JWT (App Token) ของระบบเรา
 				appToken, err := generateJWT(userID, email)
 				if err != nil {
 					fmt.Println("❌ Error generating JWT:", err)
 					continue
 				}
 
-				// จ. จับ Connection นี้ผูกกับ UserID ทันที (ล็อกอินสำเร็จ)
 				mutex.Lock()
 				userConnections[userID] = conn
 				loggedInUserID = userID
 				mutex.Unlock()
 
-				// ฉ. ส่ง JWT กลับไปให้ Flutter
 				response := map[string]interface{}{
 					"action":  "login_success",
 					"jwt":     appToken,
@@ -208,7 +237,6 @@ func handleClient(conn net.Conn) {
 				conn.Write(append(jsonResp, '\n'))
 				fmt.Printf("✅ Google Login Success! Issued JWT for User %d\n", userID)
 
-			// 🟢 1. การลงทะเบียน Connection เข้ากับ UserID
 			case "register_connection":
 				mutex.Lock()
 				userConnections[req.UserID] = conn
@@ -216,40 +244,32 @@ func handleClient(conn net.Conn) {
 				mutex.Unlock()
 				fmt.Printf("✅ User %d registered their connection\n", req.UserID)
 
-			// 🟢 2. การส่งข้อความส่วนตัว (Direct Message)
 			case "send_message":
 				if req.ReceiverID == 0 {
 					fmt.Println("❌ Error: Missing receiver_id")
 					continue
 				}
 
-				// บันทึกลง Database
 				msgID, err := saveMessage(req.UserID, req.ReceiverID, req.Content, req.ImageURL)
 				if err == nil {
-					// ดึงข้อมูลเต็มกลับมา (พร้อม Timestamp)
 					fullMsg, err := getMessageByID(msgID)
 					if err == nil {
-						// ห่อข้อมูลเพื่อบอก Client ว่านี่คือ Message นะ ไม่ใช่ Post Feed
 						responseMap := map[string]interface{}{
 							"action": "new_message",
 							"data":   fullMsg,
 						}
 						msgJSON, _ := json.Marshal(responseMap)
 
-						// ส่งไปหาคนรับ (ถ้าออนไลน์)
 						sendMessageToUser(req.ReceiverID, append(msgJSON, '\n'))
-						// ส่งกลับไปหาตัวเองด้วย (เผื่อใช้อัปเดต UI ทันที)
 						sendMessageToUser(req.UserID, append(msgJSON, '\n'))
 					}
 				}
 
-			// 🟡 3. ฟังก์ชันเดิม (Post Feed)
 			case "create_post":
 				newPostID, err := createPost(req.UserID, req.Content, req.ImageURLs, nil)
 				if err == nil {
 					newPostData, err := getSinglePost(newPostID)
 					if err == nil {
-						// ห่อข้อมูลเพื่อให้ Client แยกแยะได้ (Optionally) หรือส่งตรงๆ แบบเดิม
 						responseMap := map[string]interface{}{
 							"action": "new_post",
 							"data":   newPostData,
@@ -274,28 +294,36 @@ func handleClient(conn net.Conn) {
 	}
 }
 
+// 🟢 ฟังก์ชันส่ง Error กลับไปหา Flutter
+func sendErrorToClient(conn net.Conn, errMsg string) {
+	response := map[string]interface{}{
+		"action":  "error",
+		"message": errMsg,
+	}
+	jsonResp, _ := json.Marshal(response)
+	conn.Write(append(jsonResp, '\n'))
+}
+
 func generateJWT(userID int, email string) (string, error) {
-	// กำหนดข้อมูลที่จะใส่ลงในบัตร (Claims)
 	claims := jwt.MapClaims{
 		"user_id": userID,
 		"email":   email,
-		"exp":     time.Now().Add(time.Hour * 24 * 7).Unix(), // หมดอายุใน 7 วัน
+		"exp":     time.Now().Add(time.Hour * 24 * 7).Unix(),
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(jwtSecretKey)
+	return token.SignedString([]byte(jwtSecretKey)) // แก้ไขให้รับ []byte
 }
 
 func getOrCreateUserByEmail(email string, username string) (int, error) {
 	var userID int
-	// ลองหาจาก DB
 	err := db.QueryRow("SELECT id FROM users WHERE email = $1", email).Scan(&userID)
 
 	if err == sql.ErrNoRows {
-		// ถ้าไม่เจอ (คนเพิ่งเคยเข้าครั้งแรก) ให้ Insert
+		// 🟢 แก้ไข: Database ระบุว่า password_hash NOT NULL จึงต้องใส่ String ว่างไว้สำหรับ Google User
 		err = db.QueryRow(
-			"INSERT INTO users (email, username) VALUES ($1, $2) RETURNING id",
-			email, username,
+			"INSERT INTO users (email, username, password_hash) VALUES ($1, $2, $3) RETURNING id",
+			email, username, "GOOGLE_OAUTH",
 		).Scan(&userID)
 		if err != nil {
 			return 0, err
@@ -306,24 +334,20 @@ func getOrCreateUserByEmail(email string, username string) (int, error) {
 		return 0, err
 	}
 
-	return userID, nil // เจอใน DB คืนค่า ID เดิมกลับไป
+	return userID, nil
 }
 
 // =====================================================================
-// --- 5. Network Functions ---
+// --- 5. Network & Database Functions (คงเดิม) ---
 // =====================================================================
 
 func sendHistoryToClient(client net.Conn) {
 	posts, err := getFeedPosts()
 	if err != nil {
-		fmt.Println("❌ Error querying feed history:", err)
 		return
 	}
-
 	for i := len(posts) - 1; i >= 0; i-- {
 		p := posts[i]
-
-		// ห่อข้อมูลเพื่อให้ Client รู้ว่าเป็นชนิด new_post (ปรับให้เข้ากับ Message)
 		responseMap := map[string]interface{}{
 			"action": "new_post",
 			"data":   p,
@@ -331,10 +355,8 @@ func sendHistoryToClient(client net.Conn) {
 		jsonData, _ := json.Marshal(responseMap)
 		client.Write(append(jsonData, '\n'))
 	}
-	fmt.Println("✅ Sent feed history to client")
 }
 
-// 🟢 ส่งข้อมูลให้เฉพาะคนๆ เดียว (เช่น DM)
 func sendMessageToUser(userID int, data []byte) {
 	mutex.Lock()
 	defer mutex.Unlock()
@@ -342,17 +364,12 @@ func sendMessageToUser(userID int, data []byte) {
 	if conn, ok := userConnections[userID]; ok {
 		_, err := conn.Write(data)
 		if err != nil {
-			fmt.Printf("Error sending to user %d: %v\n", userID, err)
 			conn.Close()
 			delete(userConnections, userID)
 		}
-	} else {
-		// ถ้าไม่ได้ออนไลน์อยู่ ข้อความก็ถูกเซฟลง DB ไปแล้ว ไม่เป็นไร
-		fmt.Printf("User %d is offline.\n", userID)
 	}
 }
 
-// ส่งให้ทุกคนที่อยู่ในระบบ (เช่น New Feed)
 func broadcast(data []byte) {
 	mutex.Lock()
 	defer mutex.Unlock()
@@ -360,172 +377,102 @@ func broadcast(data []byte) {
 	for userID, conn := range userConnections {
 		_, err := conn.Write(data)
 		if err != nil {
-			fmt.Printf("Error broadcasting to user %d: %v\n", userID, err)
 			conn.Close()
 			delete(userConnections, userID)
 		}
 	}
 }
 
-// =====================================================================
-// --- 6. Database Functions (Post / Feed) ---
-// =====================================================================
-
 func createPost(userID int, content string, imageURLs []string, parentPostID *int) (int, error) {
 	if imageURLs == nil {
 		imageURLs = []string{}
 	}
-
-	sqlStatement := `
-        INSERT INTO posts (user_id, content, image_urls, parent_post_id) 
-        VALUES ($1, $2, $3, $4)
-        RETURNING id
-    `
+	sqlStatement := `INSERT INTO posts (user_id, content, image_urls, parent_post_id) VALUES ($1, $2, $3, $4) RETURNING id`
 	var newPostID int
 	err := db.QueryRow(sqlStatement, userID, content, pq.Array(imageURLs), parentPostID).Scan(&newPostID)
-
-	if err != nil {
-		fmt.Println("❌ Error creating post:", err)
-		return 0, err
-	}
-	fmt.Println("✅ Post created successfully! ID:", newPostID)
-	return newPostID, nil
+	return newPostID, err
 }
 
 func getSinglePost(postID int) (*PostFeed, error) {
 	sqlStatement := `
-        SELECT 
-            p.id, p.user_id, u.username, COALESCE(u.profile_image_url, ''), 
-            p.content, COALESCE(p.image_urls, '{}'), p.parent_post_id,
-            (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count,
-            p.created_at
-        FROM posts p
-        JOIN users u ON p.user_id = u.id
-        WHERE p.id = $1
-    `
+		SELECT p.id, p.user_id, u.username, COALESCE(u.profile_image_url, ''), p.content, COALESCE(p.image_urls, '{}'), p.parent_post_id,
+		(SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count, p.created_at
+		FROM posts p JOIN users u ON p.user_id = u.id WHERE p.id = $1`
 	var post PostFeed
 	var imgURLs pq.StringArray
-
 	err := db.QueryRow(sqlStatement, postID).Scan(
 		&post.PostID, &post.UserID, &post.Username, &post.ProfileImageURL,
 		&post.Content, &imgURLs, &post.ParentPostID, &post.LikeCount, &post.CreatedAt,
 	)
-
 	if err != nil {
 		return nil, err
 	}
-
 	post.ImageURLs = []string(imgURLs)
 	return &post, nil
 }
 
 func getFeedPosts() ([]PostFeed, error) {
 	sqlStatement := `
-        SELECT 
-            p.id, p.user_id, u.username, COALESCE(u.profile_image_url, ''), 
-            p.content, COALESCE(p.image_urls, '{}'), p.parent_post_id,
-            (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count,
-            p.created_at
-        FROM posts p
-        JOIN users u ON p.user_id = u.id
-        WHERE p.parent_post_id IS NULL 
-        ORDER BY p.created_at DESC
-        LIMIT 50;
-    `
+		SELECT p.id, p.user_id, u.username, COALESCE(u.profile_image_url, ''), p.content, COALESCE(p.image_urls, '{}'), p.parent_post_id,
+		(SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count, p.created_at
+		FROM posts p JOIN users u ON p.user_id = u.id WHERE p.parent_post_id IS NULL ORDER BY p.created_at DESC LIMIT 50;`
 	rows, err := db.Query(sqlStatement)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
 	var feed []PostFeed
 	for rows.Next() {
 		var post PostFeed
 		var imgURLs pq.StringArray
-
-		err := rows.Scan(
+		if err := rows.Scan(
 			&post.PostID, &post.UserID, &post.Username, &post.ProfileImageURL,
 			&post.Content, &imgURLs, &post.ParentPostID, &post.LikeCount, &post.CreatedAt,
-		)
-		if err == nil {
+		); err == nil {
 			post.ImageURLs = []string(imgURLs)
 			feed = append(feed, post)
-		} else {
-			fmt.Println("Scan Error:", err)
 		}
 	}
 	return feed, nil
 }
-
-// =====================================================================
-// --- 7. Database Functions (Messages) --- 🟢 (เพิ่มใหม่)
-// =====================================================================
 
 func saveMessage(senderID int, receiverID int, content string, imageURL string) (int, error) {
 	var imgParam interface{} = imageURL
 	if imageURL == "" {
 		imgParam = nil
 	}
-
 	var contentParam interface{} = content
 	if content == "" {
 		contentParam = nil
 	}
-
-	sqlStatement := `
-        INSERT INTO messages (sender_id, receiver_id, content, image_url) 
-        VALUES ($1, $2, $3, $4)
-        RETURNING id
-    `
+	sqlStatement := `INSERT INTO messages (sender_id, receiver_id, content, image_url) VALUES ($1, $2, $3, $4) RETURNING id`
 	var newMsgID int
 	err := db.QueryRow(sqlStatement, senderID, receiverID, contentParam, imgParam).Scan(&newMsgID)
-
-	if err != nil {
-		fmt.Println("❌ Error saving message:", err)
-		return 0, err
-	}
-	fmt.Println("📩 Message saved! ID:", newMsgID)
-	return newMsgID, nil
+	return newMsgID, err
 }
 
 func getMessageByID(msgID int) (*Message, error) {
-	sqlStatement := `
-        SELECT id, sender_id, receiver_id, COALESCE(content, ''), image_url, is_read, created_at 
-        FROM messages WHERE id = $1
-    `
+	sqlStatement := `SELECT id, sender_id, receiver_id, COALESCE(content, ''), image_url, is_read, created_at FROM messages WHERE id = $1`
 	var msg Message
 	err := db.QueryRow(sqlStatement, msgID).Scan(
-		&msg.ID, &msg.SenderID, &msg.ReceiverID,
-		&msg.Content, &msg.ImageURL, &msg.IsRead, &msg.CreatedAt,
+		&msg.ID, &msg.SenderID, &msg.ReceiverID, &msg.Content, &msg.ImageURL, &msg.IsRead, &msg.CreatedAt,
 	)
-
-	if err != nil {
-		return nil, err
-	}
-	return &msg, nil
+	return &msg, err
 }
-
-// =====================================================================
-// --- 8. Interaction Functions ---
-// =====================================================================
 
 func toggleLike(userID int, postID int) {
 	var exists bool
 	db.QueryRow(`SELECT EXISTS(SELECT 1 FROM likes WHERE user_id = $1 AND post_id = $2)`, userID, postID).Scan(&exists)
-
 	if exists {
 		db.Exec(`DELETE FROM likes WHERE user_id = $1 AND post_id = $2`, userID, postID)
-		fmt.Println("💔 Unliked post")
 	} else {
 		db.Exec(`INSERT INTO likes (user_id, post_id) VALUES ($1, $2)`, userID, postID)
-		fmt.Println("❤️ Liked post")
 	}
 }
 
 func toggleRepost(userID int, postID int) {
 	var exists bool
 	db.QueryRow(`SELECT EXISTS(SELECT 1 FROM reposts WHERE user_id = $1 AND post_id = $2)`, userID, postID).Scan(&exists)
-
 	if exists {
 		db.Exec(`DELETE FROM reposts WHERE user_id = $1 AND post_id = $2`, userID, postID)
 	} else {
@@ -536,7 +483,6 @@ func toggleRepost(userID int, postID int) {
 func toggleBookmark(userID int, postID int) {
 	var exists bool
 	db.QueryRow(`SELECT EXISTS(SELECT 1 FROM bookmarks WHERE user_id = $1 AND post_id = $2)`, userID, postID).Scan(&exists)
-
 	if exists {
 		db.Exec(`DELETE FROM bookmarks WHERE user_id = $1 AND post_id = $2`, userID, postID)
 	} else {
