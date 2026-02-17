@@ -132,7 +132,7 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 
 		switch req.Action {
 		case "email_register":
-			if req.Email == "" || req.Password == "" || req.Username == "" || req.OTP == "" {
+			if req.Email == "" || req.Password == "" || req.Username == "" {
 				sendErrorToClient(conn, "Missing required fields")
 				continue
 			}
