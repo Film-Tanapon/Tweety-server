@@ -146,13 +146,17 @@ func handleGoogleLogin(conn *websocket.Conn, req ActionRequest, loggedInUserID *
 }
 
 // ======================================================================POST========================================================================//
-func sendHistoryToClient(client *websocket.Conn) {
-	posts, err := getFeedPosts()
-	if err == nil {
-		for i := len(posts) - 1; i >= 0; i-- {
-			sendJSON(client, map[string]interface{}{"action": "new_post", "data": posts[i]})
-		}
+func sendHistoryToClient(conn *websocket.Conn, userID int) {
+	posts, err := getFeedPostsWithUser(userID)
+	if err != nil {
+		fmt.Println("Error loading posts:", err)
+		return
 	}
+
+	sendJSON(conn, map[string]interface{}{
+		"action": "post_history",
+		"data":   posts,
+	})
 }
 
 func handleCreatePost(req ActionRequest) {
@@ -187,6 +191,57 @@ func handleDeletePost(conn *websocket.Conn, req ActionRequest) {
 		"action":  "post_deleted",
 		"post_id": req.PostID,
 	})
+}
+
+func handleLike(conn *websocket.Conn, req ActionRequest, loggedInUserID int) {
+	if loggedInUserID == 0 {
+		sendErrorToClient(conn, "Please login first")
+		return
+	}
+
+	postID := req.PostID
+
+	status, err := toggleLike(loggedInUserID, postID)
+	if err != nil {
+		sendErrorToClient(conn, "Failed to toggle like")
+		return
+	}
+
+	fmt.Printf("User %d toggled like for post %d. New status: %v\n", loggedInUserID, postID, status)
+}
+
+func handleRepost(conn *websocket.Conn, req ActionRequest, loggedInUserID int) {
+	if loggedInUserID == 0 {
+		sendErrorToClient(conn, "Please login first")
+		return
+	}
+
+	postID := req.PostID
+
+	status, err := toggleRepost(loggedInUserID, postID)
+	if err != nil {
+		sendErrorToClient(conn, "Failed to toggle repost")
+		return
+	}
+
+	fmt.Printf("User %d toggled repost for post %d. New status: %v\n", loggedInUserID, postID, status)
+}
+
+func handleBookmark(conn *websocket.Conn, req ActionRequest, loggedInUserID int) {
+	if loggedInUserID == 0 {
+		sendErrorToClient(conn, "Please login first")
+		return
+	}
+
+	postID := req.PostID
+
+	status, err := toggleBookmark(loggedInUserID, postID)
+	if err != nil {
+		sendErrorToClient(conn, "Failed to toggle bookmark")
+		return
+	}
+
+	fmt.Printf("User %d toggled bookmark for post %d. New status: %v\n", loggedInUserID, postID, status)
 }
 
 // ======================================================================USER========================================================================//
@@ -301,8 +356,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	sendHistoryToClient(conn)
-
 	for {
 		var req ActionRequest
 		err := conn.ReadJSON(&req)
@@ -315,13 +368,28 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		case "email_register":
 			handleEmailRegister(conn, req)
 		case "login":
-			handleLogin(conn, req, &loggedInUserID) // ส่ง pointer ไปเพื่ออัปเดต ID
+			handleLogin(conn, req, &loggedInUserID)
 		case "google_login":
 			handleGoogleLogin(conn, req, &loggedInUserID)
+		case "register_connection":
+			loggedInUserID = req.UserID
+			sendHistoryToClient(conn, loggedInUserID)
+
+			mutex.Lock()
+			userConnections[loggedInUserID] = conn
+			mutex.Unlock()
+
+			fmt.Println("User registered:", loggedInUserID)
 		case "send_message":
 			handleSendMessage(req)
 		case "create_post":
 			handleCreatePost(req)
+		case "toggle_like":
+			handleLike(conn, req, loggedInUserID)
+		case "toggle_repost":
+			handleRepost(conn, req, loggedInUserID)
+		case "toggle_bookmark":
+			handleBookmark(conn, req, loggedInUserID)
 		case "get_chat_history":
 			handleGetChatHistory(conn, req)
 		case "update_profile":

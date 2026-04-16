@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/lib/pq"
 )
@@ -143,6 +144,72 @@ func deletePost(postID int, userID int) error {
 }
 
 // ======================================================================LIKE========================================================================//
+func getFeedPostsWithUser(userID int) ([]map[string]interface{}, error) {
+	rows, err := db.Query(`
+		SELECT 
+			p.id,
+			p.content,
+			p.created_at,
+			u.username,
+
+			(SELECT COUNT(*) FROM likes WHERE post_id = p.id),
+			EXISTS(SELECT 1 FROM likes WHERE user_id=$1 AND post_id=p.id),
+
+			(SELECT COUNT(*) FROM reposts WHERE post_id = p.id),
+			EXISTS(SELECT 1 FROM reposts WHERE user_id=$1 AND post_id=p.id),
+
+			EXISTS(SELECT 1 FROM bookmarks WHERE user_id=$1 AND post_id=p.id)
+
+		FROM posts p
+		JOIN users u ON p.user_id = u.id
+		ORDER BY p.created_at DESC
+	`, userID)
+
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var posts []map[string]interface{}
+
+	for rows.Next() {
+		var postID int
+		var content, username string
+		var createdAt time.Time
+		var likesCount, repostsCount int
+		var isLiked, isReposted, isBookmarked bool
+
+		err := rows.Scan(
+			&postID,
+			&content,
+			&createdAt,
+			&username,
+			&likesCount,
+			&isLiked,
+			&repostsCount,
+			&isReposted,
+			&isBookmarked,
+		)
+		if err != nil {
+			continue
+		}
+
+		posts = append(posts, map[string]interface{}{
+			"post_id":       postID,
+			"content":       content,
+			"created_at":    createdAt,
+			"username":      username,
+			"likes_count":   likesCount,
+			"is_liked":      isLiked,
+			"reposts_count": repostsCount,
+			"is_reposted":   isReposted,
+			"is_bookmarked": isBookmarked,
+		})
+	}
+
+	return posts, nil
+}
+
 func toggleLike(userID int, postID int) (bool, error) {
 	var isLiked bool
 
